@@ -1,12 +1,12 @@
 {
   "domain": "reolink_talk",
   "name": "Reolink Talk (Two-Way Audio)",
-  "version": "0.1.0",
-  "codeowners": [],
+  "version": "0.1.1",
+  "codeowners": ["@kucau0901"],
   "config_flow": true,
-  "documentation": "https://github.com/joeblack2k/reolink_talk",
+  "documentation": "https://github.com/kucau0901/reolink_talk",
   "dependencies": ["reolink"],
   "iot_class": "local_push",
-  "issue_tracker": "https://github.com/joeblack2k/reolink_talk/issues",
+  "issue_tracker": "https://github.com/kucau0901/reolink_talk/issues",
   "requirements": []
 }
