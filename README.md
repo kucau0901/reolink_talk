@@ -44,6 +44,7 @@ This integration only works for cameras that expose Reolink **TalkAbility** with
 ### Confirmed Working
 
 - Reolink **Video Doorbell series** (tested on a doorbell in this Home Assistant setup)
+- Reolink **RLC-811A** on firmware `v3.1.0.4695_2504301440` (tested on Home Assistant 2026.5.2; requires the rspCode 421 retry-after-stop fix shipped in this fork)
 
 ### Expected To Work (Needs Community Confirmation)
 
