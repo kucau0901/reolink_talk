@@ -11,14 +11,24 @@ Expose Reolink cameras that support **two-way audio** as `media_player` entities
 
 This integration piggybacks on the **official Reolink integration** for credentials and device selection, but it **does not depend on go2rtc, Frigate, or Docker** for talkback.
 
-## Install (HACS)
+## Install (HACS — custom repository)
 
-1. Add this repository to HACS as a **custom repository** (category: Integration).
-2. Install **Reolink Talk (Two-Way Audio)**.
-3. Restart Home Assistant.
-4. Add the integration in Settings -> Devices & Services.
+This integration is not in the default HACS index. Install it as a **custom repository**:
+
+1. In Home Assistant, open **HACS**.
+2. Click the **⋮ menu** (top right) → **Custom repositories**.
+3. Paste this URL into the **Repository** field:
+   ```
+   https://github.com/kucau0901/reolink_talk
+   ```
+   Set **Type** to **Integration**, then click **Add**.
+4. Search HACS for **Reolink Talk (Two-Way Audio)** and click **Download**.
+5. **Restart Home Assistant.**
+6. Go to **Settings → Devices & Services → Add Integration**, and pick **Reolink Talk (Two-Way Audio)**.
 
 [![Add Integration](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start?domain=reolink_talk)
+
+> Updates will arrive automatically through HACS whenever this repo's `main` branch changes.
 
 ## Requirements
 
