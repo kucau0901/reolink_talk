@@ -800,9 +800,16 @@ class BaichuanTalkClient:
         await self._send_raw_ack(header + enc_ext + binary_payload, 202, full_mess_id, timeout=5.0)
 
     async def _try_talk_config(self, channel, variants):
-        """Try each (variant x cipher) ONCE. Return the cipher that worked.
-        Raise immediately on a 421/422 'busy' status (caller must reconnect to clear it).
-        A 400 (config quirk) is non-fatal: move on to the next variant/cipher."""
+        """Try each (variant x cipher). Return the cipher that worked.
+
+        On a 421/422 'talk-busy' status, send an in-place TALKRESET (cmd 11) on the
+        SAME connection and retry that exact variant ONCE before moving on. This is the
+        ecosystem-proven cheap clear (it is what neolink and the official Reolink app do:
+        the camera replies 422 when a prior session crashed before sending cmd 11, and a
+        single cmd 11 + retry releases the lock) — verified on the RLC-811A gate. It
+        avoids the costly reconnect+re-login (the source of the multi-second speaker-group
+        desync), which the caller still keeps as a fallback only if EVERY variant remains
+        busy. A 400 (config quirk) is non-fatal: move on to the next variant/cipher."""
         last = None
         for cfg in variants:
             for enc in ("aes", "bc"):
@@ -812,7 +819,21 @@ class BaichuanTalkClient:
                 except BaichuanApiError as e:
                     last = e
                     if e.rsp_code in (421, 422):
-                        raise
+                        # In-place reset + one retry on the SAME connection (no reconnect).
+                        try:
+                            await self.stop_talk(channel, enc_type=enc, timeout=3.0)
+                        except Exception:
+                            pass
+                        try:
+                            await self.send_talk_config(channel, cfg, enc_type=enc)
+                            _LOG.info(
+                                "TalkConfig busy (status %s) on ch %s — cleared in-place with "
+                                "TALKRESET (cmd 11), no reconnect needed",
+                                e.rsp_code, channel,
+                            )
+                            return enc
+                        except BaichuanApiError as e2:
+                            last = e2  # still busy on this variant — fall through to the next
                     continue
         raise last or RuntimeError("TalkConfig rejected for all variants/encryptions")
 

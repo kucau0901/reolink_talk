@@ -35,11 +35,15 @@ so it no longer relies on the official Reolink integration at runtime.
 - **Loudness normalization (v0.3.1+):** audio is loudness-normalized (EBU R128 `loudnorm` +
   peak limiter) during transcoding so quiet TTS plays **loud and consistent** through the small
   camera speaker. The volume slider then attenuates from that loud baseline (`1.0` = full loud).
-- **Automatic talk-busy recovery (v0.3.2+):** if the camera wedges in a "talk busy" state
-  (Baichuan status `421`/`422`) — e.g. after a talk session was interrupted without a clean
-  stop — the client now clears it **in software** (best-effort stop → reconnect → re-login, up
-  to 3 cycles) and sends a stop before closing every session. Talkback self-heals **without a
-  camera reboot**, so a stuck speaker no longer needs babysitting.
+- **Automatic talk-busy recovery (v0.3.2+, fast in-place clear in v0.3.3):** if the camera
+  wedges in a "talk busy" state (Baichuan status `421`/`422`) — e.g. after a talk session was
+  interrupted without a clean stop — the client clears it **in software, no camera reboot**.
+  As of **v0.3.3** it does this the cheap way the official Reolink app does: on a `421`/`422`
+  it sends a `TALKRESET` (stop, cmd 11) **on the same connection** and retries the config
+  immediately (~tens of ms). A wedged speaker therefore stays **in sync** with the other
+  speakers in a `media_player` group instead of lagging seconds behind. A full reconnect +
+  re-login (up to 3 cycles) remains only as a fallback for a deep wedge, and a stop is always
+  sent before closing every session so talkback self-heals **without babysitting**.
 
 ## Install (HACS — custom repository)
 
