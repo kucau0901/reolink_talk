@@ -1,0 +1,39 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Reolink Talk",
+        "description": "Found the Reolink integration. Credentials will be imported automatically so this component is standalone afterwards."
+      },
+      "manual": {
+        "title": "Reolink Talk (manual)",
+        "description": "Enter the camera's Baichuan credentials. These are stored locally and do not require the Reolink integration.",
+        "data": {
+          "host": "Host (IP address)",
+          "username": "Username",
+          "password": "Password",
+          "channel": "Channel",
+          "baichuan_port": "Baichuan port"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not log in to the camera. Check the host, credentials and Baichuan port."
+    },
+    "abort": {
+      "single_instance_allowed": "Reolink Talk is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Reolink Talk options",
+        "description": "Re-import credentials from the selected Reolink cameras and set the talk channel.",
+        "data": {
+          "reolink_entry_ids": "Reolink cameras",
+          "channel": "Channel"
+        }
+      }
+    }
+  }
+}

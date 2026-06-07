@@ -15,7 +15,19 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import CONF_CHANNEL, CONF_REOLINK_ENTRY_IDS, DEFAULT_CHANNEL, DOMAIN
+from .const import (
+    CONF_BC_PORT,
+    CONF_CAMERAS,
+    CONF_CHANNEL,
+    CONF_HOST,
+    CONF_PASSWORD,
+    CONF_REOLINK_ENTRY_IDS,
+    CONF_TITLE,
+    CONF_USERNAME,
+    DEFAULT_BC_PORT,
+    DEFAULT_CHANNEL,
+    DOMAIN,
+)
 from .baichuan_talk import BaichuanTalkClient
 from .talk import (
     build_talk_config_variants,
@@ -42,24 +54,42 @@ class ReolinkTarget:
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback) -> None:
+    entities: list[ReolinkTalkPlayer] = []
+
+    # STANDALONE (v0.3.0+): credentials are stored in our OWN entry.data["cameras"],
+    # keyed by the original Reolink entry_id so unique_ids / entity_ids are preserved.
+    cameras: dict = entry.data.get(CONF_CAMERAS) or {}
+    if cameras:
+        for key, cam in cameras.items():
+            try:
+                target = ReolinkTarget(
+                    host=cam[CONF_HOST],
+                    http_port=None,
+                    use_https=None,
+                    port=int(cam.get(CONF_BC_PORT, DEFAULT_BC_PORT)),
+                    username=cam[CONF_USERNAME],
+                    password=cam.get(CONF_PASSWORD, ""),
+                    title=cam.get(CONF_TITLE, cam[CONF_HOST]),
+                    channel=int(cam.get(CONF_CHANNEL, DEFAULT_CHANNEL)),
+                )
+            except KeyError as err:
+                _LOGGER.warning("reolink_talk: skipping camera %s (missing field %s)", key, err)
+                continue
+            entities.append(ReolinkTalkPlayer(hass, key, target, f"Reolink Talk {target.title}"))
+        async_add_entities(entities, update_before_add=False)
+        return
+
+    # LEGACY FALLBACK (only before migration/import has populated `cameras`):
+    # read credentials live from the Reolink config entries.
     reolink_entry_ids: list[str] = entry.options.get(CONF_REOLINK_ENTRY_IDS, [])
     if not reolink_entry_ids:
-        # Be resilient: on first install or after entry migrations, options can
-        # be empty. Default to all loaded Reolink config entries.
         reolink_entry_ids = [e.entry_id for e in hass.config_entries.async_entries("reolink")]
     channel: int = int(entry.options.get(CONF_CHANNEL, DEFAULT_CHANNEL))
-
     reolink_entries = {e.entry_id: e for e in hass.config_entries.async_entries("reolink")}
-
-    entities: list[ReolinkTalkPlayer] = []
     for reolink_entry_id in reolink_entry_ids:
         re_entry = reolink_entries.get(reolink_entry_id)
         if re_entry is None:
             continue
-        # Human-friendly name. The entity_id is controlled by the entity registry
-        # (unique_id), so changing the name will not break existing installs.
-        title = re_entry.title or reolink_entry_id
-        mp_name = f"Reolink Talk {title}"
         data = re_entry.data
         try:
             target = ReolinkTarget(
@@ -74,7 +104,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
             )
         except KeyError:
             continue
-        entities.append(ReolinkTalkPlayer(hass, reolink_entry_id, target, mp_name))
+        entities.append(ReolinkTalkPlayer(hass, reolink_entry_id, target, f"Reolink Talk {re_entry.title or reolink_entry_id}"))
 
     async_add_entities(entities, update_before_add=False)
 
