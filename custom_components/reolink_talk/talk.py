@@ -622,27 +622,61 @@ async def send_talk_binary(
             payload_offset,
         )
 
-    # --- reolink_aio >=0.20 transport port (was bc._transport / bc._mutex) ---
-    # 0.20 moved the asyncio transport + send-lock OFF the Baichuan object and
-    # onto bc._connection (BaichuanTcpConnection/Udp) and added
-    # send_without_wait(data, cmd_id): writes the raw packet under the
-    # connection mutex WITHOUT awaiting a response - exactly right for streaming
-    # talk audio (the caller paces each chunk). Older reolink_aio kept the
-    # transport+lock on the Baichuan object, so fall back to a direct write.
+    # --- reolink_aio >=0.20 transport port WITH best-effort ACK wait ---
+    # 0.20 moved transport+lock onto bc._connection. Crucially, some firmwares
+    # (RLC-811A) SILENTLY DROP talk audio unless the sender waits for the camera
+    # to ACK each cmd-202 packet (flow control). reolink_aio resolves a future in
+    # conn.receive_futures[cmd_id][full_mess_id] when the ACK arrives, so we
+    # register one, fire the packet via send_without_wait(), then wait briefly.
+    # A missing ACK is tolerated (short timeout, swallowed) so streaming never
+    # stalls. Falls back to a raw transport write on older reolink_aio.
     await bc._connect_if_needed()
     conn = getattr(bc, "_connection", None)
-    if conn is not None and hasattr(conn, "send_without_wait"):
+    if conn is None:
+        raise RuntimeError("Baichuan connection not available for talk send")
+    full_mess_id = int.from_bytes(
+        int(ch_id).to_bytes(1, "little") + int(bc._mess_id).to_bytes(3, "little"),
+        "little",
+    )
+    loop = getattr(conn, "_loop", None) or asyncio.get_event_loop()
+    recv = getattr(conn, "receive_futures", None)
+    ack = None
+    if isinstance(recv, dict):
+        try:
+            ack = loop.create_future()
+            recv.setdefault(cmd_id, {})[full_mess_id] = ack
+        except Exception:
+            ack = None
+    # write the raw packet (fire-and-forget at the transport layer)
+    if hasattr(conn, "send_without_wait"):
         await conn.send_without_wait(packet, cmd_id)
-        return
-    transport = getattr(bc, "_transport", None) or getattr(conn, "_transport", None)
-    if transport is None:
-        raise RuntimeError("Baichuan transport not available for talk send")
-    lock = getattr(bc, "_mutex", None) or getattr(bc, "_login_mutex", None)
-    if lock is not None:
-        async with lock:
-            transport.write(packet)
     else:
-        transport.write(packet)
+        transport = getattr(bc, "_transport", None) or getattr(conn, "_transport", None)
+        if transport is None:
+            raise RuntimeError("Baichuan transport not available for talk send")
+        lock = getattr(bc, "_mutex", None) or getattr(bc, "_login_mutex", None)
+        if lock is not None:
+            async with lock:
+                transport.write(packet)
+        else:
+            transport.write(packet)
+    # best-effort wait for the camera ACK (flow control); missing ACK tolerated
+    if ack is not None:
+        try:
+            async with asyncio.timeout(5):
+                await ack
+        except Exception:
+            pass
+        finally:
+            try:
+                if not ack.done():
+                    ack.cancel()
+                futs = recv.get(cmd_id, {}) if isinstance(recv, dict) else {}
+                futs.pop(full_mess_id, None)
+                if isinstance(recv, dict) and cmd_id in recv and not recv[cmd_id]:
+                    recv.pop(cmd_id, None)
+            except Exception:
+                pass
 
 
 async def talk_playback(
