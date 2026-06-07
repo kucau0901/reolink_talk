@@ -622,35 +622,27 @@ async def send_talk_binary(
             payload_offset,
         )
 
-    # Wait for the camera ack like neolink does (it subscribes to MSG_ID_TALK and awaits recv).
-    # Without this, some firmwares may silently drop packets under load.
+    # --- reolink_aio >=0.20 transport port (was bc._transport / bc._mutex) ---
+    # 0.20 moved the asyncio transport + send-lock OFF the Baichuan object and
+    # onto bc._connection (BaichuanTcpConnection/Udp) and added
+    # send_without_wait(data, cmd_id): writes the raw packet under the
+    # connection mutex WITHOUT awaiting a response - exactly right for streaming
+    # talk audio (the caller paces each chunk). Older reolink_aio kept the
+    # transport+lock on the Baichuan object, so fall back to a direct write.
     await bc._connect_if_needed()
-    proto = getattr(bc, "_protocol", None)
-    loop = getattr(bc, "_loop", None)
-    if proto is None or loop is None:
-        async with bc._mutex:
-            bc._transport.write(packet)
+    conn = getattr(bc, "_connection", None)
+    if conn is not None and hasattr(conn, "send_without_wait"):
+        await conn.send_without_wait(packet, cmd_id)
         return
-
-    full_mess_id = int.from_bytes(int(ch_id).to_bytes(1, "little") + int(bc._mess_id).to_bytes(3, "little"), "little")
-    receive_future = loop.create_future()
-    proto.receive_futures.setdefault(cmd_id, {})[full_mess_id] = receive_future
-
-    try:
-        async with bc._mutex:
-            bc._transport.write(packet)
-        async with asyncio.timeout(5):
-            await receive_future
-    finally:
-        try:
-            if not receive_future.done():
-                receive_future.cancel()
-        except Exception:
-            pass
-        futs = proto.receive_futures.get(cmd_id, {})
-        futs.pop(full_mess_id, None)
-        if not futs and cmd_id in proto.receive_futures:
-            proto.receive_futures.pop(cmd_id, None)
+    transport = getattr(bc, "_transport", None) or getattr(conn, "_transport", None)
+    if transport is None:
+        raise RuntimeError("Baichuan transport not available for talk send")
+    lock = getattr(bc, "_mutex", None) or getattr(bc, "_login_mutex", None)
+    if lock is not None:
+        async with lock:
+            transport.write(packet)
+    else:
+        transport.write(packet)
 
 
 async def talk_playback(
