@@ -589,7 +589,11 @@ async def send_talk_binary(
     if enc_type == bc_util.EncType.BC:
         enc_ext = bc_util.encrypt_baichuan(ext, ch_id)  # enc_offset = ch_id
     else:
-        enc_ext = bc._aes_encrypt(ext)
+        # FIX 2026-06-07: reolink_aio._aes_encrypt() now requires bytes
+        # (older versions encoded str internally). On HA w/ current reolink_aio +
+        # Python 3.14 this raised "Object type <class 'str'> cannot be passed to
+        # C code" from PyCryptodome. Encode the Extension XML before encrypting.
+        enc_ext = bc._aes_encrypt(ext.encode("utf-8") if isinstance(ext, str) else ext)
     payload_offset = len(enc_ext)
     mess_len = payload_offset + len(binary_payload)
 
