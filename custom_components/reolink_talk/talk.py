@@ -657,14 +657,15 @@ async def talk_playback(
     from reolink_aio.baichuan import util as bc_util
 
     async def _send_with_fallback(cmd_id: int, *, body: str = "") -> bc_util.EncType:
-        # Some firmwares expect BC encryption for talk commands (otherwise 400).
+        # Some firmwares expect BC encryption for talk commands (reject AES with
+        # status 400/421/422). Fall back AES->BC on any of those.
         for enc in (bc_util.EncType.AES, bc_util.EncType.BC):
             try:
                 await bc.send(cmd_id=cmd_id, channel=channel, body=body, enc_type=enc)
                 return enc
             except ApiError as err:
                 # Retry with BC only for "bad request" style errors.
-                if getattr(err, "rspCode", None) == 400 and enc == bc_util.EncType.AES:
+                if getattr(err, "rspCode", None) in (400, 421, 422) and enc == bc_util.EncType.AES:
                     continue
                 raise
         return bc_util.EncType.BC
@@ -706,8 +707,10 @@ async def talk_playback(
             raise last_err
     except ApiError as err:
         if getattr(err, "rspCode", None) in (421, 422):
-            # Stop talk and retry. Use the same AES->BC fallback logic.
-            await _send_with_fallback(11)
+            # Stop any existing talk session (best-effort: the camera may reject the
+            # stop with 421 if nothing is open) then retry TalkConfig.
+            await _stop_talk_best_effort(bc_util.EncType.AES)
+            await _stop_talk_best_effort(bc_util.EncType.BC)
             last_err = None
             for talk_cfg in build_talk_config_variants(channel, ability):
                 try:
