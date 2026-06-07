@@ -664,6 +664,14 @@ class BaichuanTalkClient:
         self._wlock = asyncio.Lock()
 
     async def connect(self):
+        # Idempotent: drop any existing transport first so a retry never leaks a 2nd connection.
+        if self.transport is not None:
+            try:
+                self.transport.close()
+            except Exception:
+                pass
+            self.transport = None
+            self.proto = None
         loop = asyncio.get_event_loop()
         self.transport, self.proto = await loop.create_connection(
             _BaichuanProtocol, self.host, self.port
@@ -742,8 +750,33 @@ class BaichuanTalkClient:
     async def send_talk_config(self, channel, config_xml, enc_type="aes"):
         return await self._send(201, channel=channel, body=config_xml, enc_type=enc_type)
 
-    async def stop_talk(self, channel, enc_type="aes"):
-        return await self._send(11, channel=channel, enc_type=enc_type)
+    async def stop_talk(self, channel, enc_type="aes", timeout=TIMEOUT):
+        return await self._send(11, channel=channel, enc_type=enc_type, timeout=timeout)
+
+    async def _best_effort_stop(self, channel, timeout=3.0):
+        """Release the camera talk lock (cmd 11) on BOTH ciphers; never raises, short timeout."""
+        for se in ("aes", "bc"):
+            try:
+                await self.stop_talk(channel, enc_type=se, timeout=timeout)
+            except Exception:
+                pass
+
+    async def reconnect(self):
+        """Drop the (possibly wedged) TCP connection and re-establish a fresh, logged-in
+        session. On the RLC-811A the talk lock is tied to the connection, so dropping it and
+        re-logging-in is what clears a 421 'talk-busy' state in code — the same effect a
+        camera reboot has, without rebooting."""
+        try:
+            if self.transport:
+                self.transport.close()
+        except Exception:
+            pass
+        self.transport = None
+        self.proto = None
+        self.logged_in = False
+        await asyncio.sleep(0.2)
+        await self.connect()
+        await self.login()
 
     async def send_talk_audio(self, channel, binary_payload: bytes, enc_type="aes"):
         """cmd 202: encrypted Extension XML (binaryData/channelId) + raw BcMedia payload + best-effort ACK."""
@@ -766,31 +799,52 @@ class BaichuanTalkClient:
         )
         await self._send_raw_ack(header + enc_ext + binary_payload, 202, full_mess_id, timeout=5.0)
 
-    async def talk(self, channel, adpcm_payloads, sample_rate, full_block, variants):
-        """High-level: TalkConfig (AES->BC + variant fallback, best-effort stop) -> audio loop -> stop."""
-        enc_used = None
-        last_err = None
+    async def _try_talk_config(self, channel, variants):
+        """Try each (variant x cipher) ONCE. Return the cipher that worked.
+        Raise immediately on a 421/422 'busy' status (caller must reconnect to clear it).
+        A 400 (config quirk) is non-fatal: move on to the next variant/cipher."""
+        last = None
         for cfg in variants:
             for enc in ("aes", "bc"):
                 try:
                     await self.send_talk_config(channel, cfg, enc_type=enc)
-                    enc_used = enc
-                    last_err = None
-                    break
+                    return enc
                 except BaichuanApiError as e:
-                    last_err = e
-                    if e.rsp_code in (400, 421, 422):
-                        for se in ("aes", "bc"):
-                            try:
-                                await self.stop_talk(channel, enc_type=se)
-                            except Exception:
-                                pass
-                        continue
-                    raise
-            if enc_used is not None:
+                    last = e
+                    if e.rsp_code in (421, 422):
+                        raise
+                    continue
+        raise last or RuntimeError("TalkConfig rejected for all variants/encryptions")
+
+    async def talk(self, channel, adpcm_payloads, sample_rate, full_block, variants):
+        """High-level talk with self-recovery from the 421 'talk-busy' wedge — no reboot.
+        On 421/422 it stops, drops + re-opens + re-logs-in the connection (which clears the
+        camera's connection-tied talk lock), stops again, and retries — up to 3 cycles."""
+        self._talk_channel = channel
+        enc_used = None
+        for cycle in range(3):
+            try:
+                enc_used = await self._try_talk_config(channel, variants)
                 break
+            except BaichuanApiError as e:
+                if e.rsp_code in (421, 422):
+                    _LOG.warning(
+                        "TalkConfig busy (status %s) on ch %s — recovery cycle %d/3: stop + reconnect + re-login",
+                        e.rsp_code, channel, cycle + 1,
+                    )
+                    await self._best_effort_stop(channel)        # stop on the wedged connection
+                    try:
+                        await self.reconnect()                   # drop + reopen + re-login -> clears the lock
+                    except Exception as re_err:
+                        _LOG.warning("reconnect during 421 recovery failed: %s", re_err)
+                    await self._best_effort_stop(channel)        # stop on the fresh connection
+                    await asyncio.sleep(0.4)
+                    continue
+                raise  # genuine config error (e.g. 400) — variants already exhausted
         if enc_used is None:
-            raise last_err or RuntimeError("TalkConfig rejected for all variants/encryptions")
+            raise RuntimeError(
+                "TalkConfig still rejected after 3 stop+reconnect recovery cycles (camera talk-busy / firmware lock)"
+            )
         _LOG.info("TalkConfig accepted (enc=%s). streaming %d payloads...", enc_used, len(adpcm_payloads))
         for payload, blocks in adpcm_payloads:
             await self.send_talk_audio(channel, payload, enc_type=enc_used)
@@ -844,11 +898,20 @@ class BaichuanTalkClient:
             pass
 
     async def close(self):
+        # Graceful teardown: release the camera talk lock (cmd 11) BEFORE dropping the socket,
+        # so a successful OR failed talk never leaves the camera wedged at 421 for the next play.
+        ch = getattr(self, "_talk_channel", None)
+        if ch is not None and self.transport is not None:
+            await self._best_effort_stop(ch)
+            await asyncio.sleep(0.1)
         try:
             if self.transport:
                 self.transport.close()
         except Exception:
             pass
+        self.transport = None
+        self.proto = None
+        self.logged_in = False
 
 
 def _xml_value(xml: str, key: str):

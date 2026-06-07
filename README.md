@@ -35,6 +35,11 @@ so it no longer relies on the official Reolink integration at runtime.
 - **Loudness normalization (v0.3.1+):** audio is loudness-normalized (EBU R128 `loudnorm` +
   peak limiter) during transcoding so quiet TTS plays **loud and consistent** through the small
   camera speaker. The volume slider then attenuates from that loud baseline (`1.0` = full loud).
+- **Automatic talk-busy recovery (v0.3.2+):** if the camera wedges in a "talk busy" state
+  (Baichuan status `421`/`422`) — e.g. after a talk session was interrupted without a clean
+  stop — the client now clears it **in software** (best-effort stop → reconnect → re-login, up
+  to 3 cycles) and sends a stop before closing every session. Talkback self-heals **without a
+  camera reboot**, so a stuck speaker no longer needs babysitting.
 
 ## Install (HACS — custom repository)
 
