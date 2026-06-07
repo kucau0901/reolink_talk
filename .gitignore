@@ -4,3 +4,7 @@ __pycache__/
 ._*
 .venv*
 
+.storage/
+.venv-reolink-talk-debug/
+media/
+scripts/media/

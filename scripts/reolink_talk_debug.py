@@ -550,7 +550,7 @@ async def send_talk_binary(bc, *, channel: int, binary_payload: bytes, enc_type,
     if enc_type == bc_util.EncType.BC:
         enc_ext = bc_util.encrypt_baichuan(ext, ch_id)
     else:
-        enc_ext = bc._aes_encrypt(ext)
+        enc_ext = bc._aes_encrypt(ext.encode("utf-8") if isinstance(ext, str) else ext)
 
     payload_offset = len(enc_ext)
     mess_len = payload_offset + len(binary_payload)
@@ -579,35 +579,45 @@ async def send_talk_binary(bc, *, channel: int, binary_payload: bytes, enc_type,
         payload_offset,
     )
 
-    # Wait for camera ack like neolink (firmwares can drop packets otherwise).
+    # reolink_aio >=0.20 transport port + best-effort ACK wait (was bc._transport/_mutex).
     await bc._connect_if_needed()
-    proto = getattr(bc, "_protocol", None)
-    loop = getattr(bc, "_loop", None)
-
-    if proto is None or loop is None:
-        async with bc._mutex:
-            bc._transport.write(packet)
-        return
-
-    full_mess_id = int.from_bytes(int(ch_id).to_bytes(1, "little") + int(bc._mess_id).to_bytes(3, "little"), "little")
-    receive_future = loop.create_future()
-    proto.receive_futures.setdefault(cmd_id, {})[full_mess_id] = receive_future
-
-    try:
-        async with bc._mutex:
-            bc._transport.write(packet)
-        # Ack can be slow on some doorbells.
-        await asyncio.wait_for(receive_future, timeout=5.0)
-    finally:
+    conn = getattr(bc, "_connection", None)
+    if conn is None:
+        raise RuntimeError("Baichuan connection not available for talk send")
+    full_mess_id = int.from_bytes(
+        int(ch_id).to_bytes(1, "little") + int(bc._mess_id).to_bytes(3, "little"), "little")
+    loop = getattr(conn, "_loop", None) or asyncio.get_event_loop()
+    recv = getattr(conn, "receive_futures", None)
+    ack = None
+    if isinstance(recv, dict):
         try:
-            if not receive_future.done():
-                receive_future.cancel()
+            ack = loop.create_future()
+            recv.setdefault(cmd_id, {})[full_mess_id] = ack
+        except Exception:
+            ack = None
+    if hasattr(conn, "send_without_wait"):
+        await conn.send_without_wait(packet, cmd_id)
+    else:
+        transport = getattr(bc, "_transport", None) or getattr(conn, "_transport", None)
+        lock = getattr(bc, "_mutex", None) or getattr(bc, "_login_mutex", None)
+        if lock is not None:
+            async with lock:
+                transport.write(packet)
+        else:
+            transport.write(packet)
+    if ack is not None:
+        try:
+            await asyncio.wait_for(ack, timeout=5.0)
         except Exception:
             pass
-        futs = proto.receive_futures.get(cmd_id, {})
-        futs.pop(full_mess_id, None)
-        if not futs and cmd_id in proto.receive_futures:
-            proto.receive_futures.pop(cmd_id, None)
+        finally:
+            try:
+                if not ack.done():
+                    ack.cancel()
+                futs = recv.get(cmd_id, {}) if isinstance(recv, dict) else {}
+                futs.pop(full_mess_id, None)
+            except Exception:
+                pass
 
 
 async def send_talk_binary_with_encryptlen(
@@ -655,7 +665,7 @@ async def send_talk_binary_with_encryptlen(
         enc_ext = bc_util.encrypt_baichuan(ext, ch_id)
         # If we're using BC XML encryption, we still AES-encrypt the payload prefix.
     else:
-        enc_ext = bc._aes_encrypt(ext)
+        enc_ext = bc._aes_encrypt(ext.encode("utf-8") if isinstance(ext, str) else ext)
 
     # AES-encrypt payload prefix (same mode/IV as Baichuan AES XML).
     if encrypt_payload_len > 0:
