@@ -16,7 +16,15 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import CONF_CHANNEL, CONF_REOLINK_ENTRY_IDS, DEFAULT_CHANNEL, DOMAIN
-from .talk import ffmpeg_to_pcm_s16le, fetch_bytes, ima_adpcm_encode_dvi_blocks, parse_talk_ability, talk_playback
+from .baichuan_talk import BaichuanTalkClient
+from .talk import (
+    build_talk_config_variants,
+    ffmpeg_to_pcm_s16le,
+    fetch_bytes,
+    ima_adpcm_encode_dvi_blocks,
+    parse_talk_ability,
+    talk_binary_payload,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -119,44 +127,13 @@ class ReolinkTalkPlayer(MediaPlayerEntity):
         return await media_source.async_browse_media(self.hass, media_content_id)
 
     async def async_set_volume_level(self, volume: float) -> None:
-        from homeassistant.helpers.aiohttp_client import async_get_clientsession
-        from reolink_aio.api import Host
-        from reolink_aio.exceptions import InvalidParameterError, NotSupportedError, ReolinkError
-
+        # Software volume only (applied during ffmpeg transcoding). The native
+        # v0.2.0 client is intentionally dependency-free (no reolink_aio), so the
+        # camera-side "speak volume" API is not used; the slider still works and
+        # scales the streamed audio.
         volume = max(0.0, min(1.0, float(volume)))
         self._attr_volume_level = volume
         self.async_write_ha_state()
-
-        # Best-effort: some models expose "speak volume" control via the Reolink API,
-        # others do not. Regardless, we still keep a software volume (used during
-        # ffmpeg transcoding) so the slider always works.
-        vol_0_100 = int(round(volume * 100))
-
-        async with self._lock:
-            host = Host(
-                host=self._target.host,
-                username=self._target.username,
-                password=self._target.password,
-                port=self._target.http_port,
-                use_https=self._target.use_https,
-                bc_port=self._target.port,
-                aiohttp_get_session_callback=lambda: async_get_clientsession(self.hass),
-            )
-            try:
-                await host.login()
-                try:
-                    await host.set_volume(self._target.channel, volume_speak=vol_0_100)
-                except (NotSupportedError, InvalidParameterError, ReolinkError):
-                    # Do not fail the service call; software volume still applies.
-                    _LOGGER.debug(
-                        "Camera does not support volume_speak control (%s); using software volume only",
-                        self.entity_id,
-                    )
-            finally:
-                try:
-                    await host.logout()
-                except Exception:  # best-effort
-                    pass
 
     async def async_play_media(self, media_type: str, media_id: str, **kwargs) -> None:
         # Resolve HA media-source URLs if needed.
@@ -236,35 +213,28 @@ class ReolinkTalkPlayer(MediaPlayerEntity):
         return await fetch_bytes(self.hass, media_url)
 
     async def _play_bytes(self, media_bytes: bytes) -> None:
-        # Lazy imports: `reolink_aio` is already in HA because the official
-        # Reolink integration uses it.
-        from homeassistant.helpers.aiohttp_client import async_get_clientsession
-        from reolink_aio.api import Host
-
-        # 1) Connect and fetch TalkAbility to determine ADPCM parameters
-        host = Host(
-            host=self._target.host,
-            username=self._target.username,
-            password=self._target.password,
-            port=self._target.http_port,
-            use_https=self._target.use_https,
-            bc_port=self._target.port,
-            aiohttp_get_session_callback=lambda: async_get_clientsession(self.hass),
+        # NATIVE v0.2.0: talk directly over Baichuan (TCP :9000) — NO reolink_aio.
+        cli = BaichuanTalkClient(
+            self._target.host,
+            self._target.username,
+            self._target.password,
+            port=int(self._target.port),
         )
-        bc = host.baichuan
-
         try:
-            await bc.login()
-            ability = await self._probe_ability()
+            await cli.connect()
+            await cli.login()
+
+            # 1) TalkAbility (cached) -> ADPCM parameters
+            ability = self._last_ability
+            if ability is None:
+                ability_xml = await cli.get_talk_ability(self._target.channel)
+                ability = parse_talk_ability(ability_xml)
+                self._last_ability = ability
             if ability.audio_type.lower() != "adpcm":
                 raise RuntimeError(f"Unsupported Reolink talk audioType={ability.audio_type}")
 
             # 2) Transcode input -> PCM -> DVI-4 ADPCM blocks.
-            #
-            # Neolink expects ADPCM in "DVI-4" block layout with:
-            # full_block_size = (lengthPerEncoder / 2) + 4
-            #
-            # This is NOT the same as WAV ADPCM block_align.
+            # full_block_size = (lengthPerEncoder / 2) + 4 (NOT WAV block_align).
             full_block_size = (int(ability.length_per_encoder) // 2) + 4
             pcm = await ffmpeg_to_pcm_s16le(
                 media_bytes,
@@ -272,47 +242,37 @@ class ReolinkTalkPlayer(MediaPlayerEntity):
                 volume=float(self._attr_volume_level or 1.0),
             )
             adpcm_bytes = ima_adpcm_encode_dvi_blocks(pcm, full_block_size=full_block_size)
+            payloads = talk_binary_payload(adpcm_bytes, full_block_size, blocks_per_payload=4)
+            variants = build_talk_config_variants(self._target.channel, ability)
 
-            # 3) Send over Baichuan talk (cmd 201/202/11)
-            await talk_playback(bc, self._target.channel, adpcm_bytes, ability, block_align=full_block_size)
+            # 3) TalkConfig (201, AES->BC + variant + best-effort-stop fallback)
+            #    -> stream cmd-202 audio (per-packet ACK) -> stop (11).
+            await cli.talk(self._target.channel, payloads, ability.sample_rate, full_block_size, variants)
         finally:
-            try:
-                await host.logout()
-            except Exception:  # best-effort
-                pass
+            await cli.close()
 
     async def _probe_ability(self, *, timeout_s: float = 5.0):
-        from homeassistant.helpers.aiohttp_client import async_get_clientsession
-        from reolink_aio.api import Host
-
         # Cache within the entity instance to avoid extra round-trips.
         if self._last_ability is not None:
             return self._last_ability
 
-        host = Host(
-            host=self._target.host,
-            username=self._target.username,
-            password=self._target.password,
-            port=self._target.http_port,
-            use_https=self._target.use_https,
-            bc_port=self._target.port,
-            aiohttp_get_session_callback=lambda: async_get_clientsession(self.hass),
+        cli = BaichuanTalkClient(
+            self._target.host,
+            self._target.username,
+            self._target.password,
+            port=int(self._target.port),
         )
-        bc = host.baichuan
         try:
             async with asyncio.timeout(timeout_s):
-                await bc.login()
-                ability_xml = await bc.send(cmd_id=10, channel=self._target.channel)
+                await cli.connect()
+                await cli.login()
+                ability_xml = await cli.get_talk_ability(self._target.channel)
             ability = parse_talk_ability(ability_xml)
             self._last_ability = ability
 
             if ability.audio_type.lower() != "adpcm":
-                # Explicitly unsupported.
                 self._attr_available = False
                 self.async_write_ha_state()
             return ability
         finally:
-            try:
-                await host.logout()
-            except Exception:
-                pass
+            await cli.close()
