@@ -157,10 +157,11 @@ class ReolinkTalkPlayer(MediaPlayerEntity):
         return await media_source.async_browse_media(self.hass, media_content_id)
 
     async def async_set_volume_level(self, volume: float) -> None:
-        # Software volume only (applied during ffmpeg transcoding). The native
-        # v0.2.0 client is intentionally dependency-free (no reolink_aio), so the
-        # camera-side "speak volume" API is not used; the slider still works and
-        # scales the streamed audio.
+        # Software volume only. As of v0.3.1 the audio is loudness-normalized
+        # (EBU R128 loudnorm + limiter) during ffmpeg transcoding so quiet TTS plays
+        # loud and consistent; this slider then attenuates from that loud baseline
+        # (1.0 = full loud). The camera-side "speak volume" API is intentionally not
+        # used (the native client is dependency-free, no reolink_aio).
         volume = max(0.0, min(1.0, float(volume)))
         self._attr_volume_level = volume
         self.async_write_ha_state()

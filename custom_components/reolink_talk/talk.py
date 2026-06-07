@@ -393,14 +393,68 @@ _IMA_STEP_TABLE: Final[list[int]] = [
 ]
 
 
+# Loudness defaults (v0.3.1+). Camera talk speakers are small and often outdoors,
+# and TTS audio frequently arrives quiet (soft prosody / low-level synthesis), so we
+# normalize every clip to a consistent, loud target with EBU R128 loudnorm and catch
+# peaks with a limiter. `volume` (the HA volume slider, 0..1) then attenuates from
+# that loud baseline, so 1.0 = full loud and lower = quieter.
+DEFAULT_LOUDNORM_I = -14.0   # integrated loudness target (LUFS)
+DEFAULT_LOUDNORM_TP = -1.5   # true-peak ceiling (dBFS)
+DEFAULT_LOUDNORM_LRA = 11.0  # loudness range
+DEFAULT_GAIN_DB = 6.0        # extra makeup gain on top of loudnorm (limiter-protected)
+
+
+def _build_af_chain(
+    volume: float,
+    *,
+    loudnorm_i: float | None,
+    loudnorm_tp: float,
+    loudnorm_lra: float,
+    gain_db: float,
+    limiter: bool,
+) -> str:
+    """Compose the ffmpeg -af filter chain: loudnorm -> makeup gain -> volume -> limiter."""
+    filters: list[str] = []
+    if loudnorm_i is not None:
+        filters.append(f"loudnorm=I={loudnorm_i}:TP={loudnorm_tp}:LRA={loudnorm_lra}")
+    if gain_db:
+        filters.append(f"volume={gain_db}dB")
+    v = max(0.0, float(volume))
+    if abs(v - 1.0) > 1e-6:
+        filters.append(f"volume={v}")
+    if limiter:
+        # Pure peak limiting (level=false: do NOT auto-normalize), so the makeup gain
+        # above can push hot without clipping/distorting the small camera speaker.
+        filters.append("alimiter=level=false:limit=0.97")
+    return ",".join(filters) if filters else "anull"
+
+
 async def ffmpeg_to_pcm_s16le(
     input_bytes: bytes,
     *,
     sample_rate: int,
     volume: float = 1.0,
+    loudnorm_i: float | None = DEFAULT_LOUDNORM_I,
+    loudnorm_tp: float = DEFAULT_LOUDNORM_TP,
+    loudnorm_lra: float = DEFAULT_LOUDNORM_LRA,
+    gain_db: float = DEFAULT_GAIN_DB,
+    limiter: bool = True,
 ) -> bytes:
-    """Decode arbitrary audio to mono 16-bit PCM (little-endian) at sample_rate."""
+    """Decode arbitrary audio to mono 16-bit PCM (little-endian) at sample_rate.
+
+    By default (loudnorm_i set) the audio is loudness-normalized to a consistent,
+    loud target and peak-limited, so quiet TTS plays loud through the camera speaker.
+    Pass loudnorm_i=None for the legacy unprocessed behavior (just the volume gain).
+    """
     ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+    af = _build_af_chain(
+        volume,
+        loudnorm_i=loudnorm_i,
+        loudnorm_tp=loudnorm_tp,
+        loudnorm_lra=loudnorm_lra,
+        gain_db=gain_db,
+        limiter=limiter,
+    )
     cmd = [
         ffmpeg,
         "-hide_banner",
@@ -409,7 +463,7 @@ async def ffmpeg_to_pcm_s16le(
         "-i",
         "pipe:0",
         "-af",
-        f"volume={max(0.0, float(volume))}",
+        af,
         "-ac",
         "1",
         "-ar",

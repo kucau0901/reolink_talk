@@ -32,6 +32,9 @@ so it no longer relies on the official Reolink integration at runtime.
   isolated from changes in the Reolink library or integration.
 - Incoming audio is transcoded to the camera's required format with **ffmpeg**, encoded as
   **IMA ADPCM** (DVI-4 variant), and encrypted with **AES** (via `pycryptodome`) before transmission.
+- **Loudness normalization (v0.3.1+):** audio is loudness-normalized (EBU R128 `loudnorm` +
+  peak limiter) during transcoding so quiet TTS plays **loud and consistent** through the small
+  camera speaker. The volume slider then attenuates from that loud baseline (`1.0` = full loud).
 
 ## Install (HACS — custom repository)
 
