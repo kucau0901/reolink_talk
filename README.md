@@ -164,6 +164,37 @@ This repo includes two debug scripts (optional):
 - `scripts/reolink_talk_debug.py`: send a sine tone or a file to a specific camera using the native Baichuan client.
 - `scripts/reolink_talk_e2e_capture_test.py`: capture RTSP audio while sending talk to confirm speaker output is present.
 
+### Talkback "talk busy" (status `421`/`422`) — and why a camera sometimes needs a reboot
+
+If talkback suddenly stops and `TalkConfig` returns Baichuan status `421`/`422` ("talk busy"), there are **two different cases** — and they have different causes:
+
+**1. Shallow wedge — self-healing (handled automatically since v0.3.2 / v0.3.3).**
+A previous talk session didn't release the camera's talk lock cleanly (e.g. the connection dropped before a stop was sent). The component clears this *in software* — on `421`/`422` it sends a `TALKRESET` (cmd `11`) and retries on the same connection, falling back to reconnect + re-login if needed. **No action required.**
+
+**2. Deep wedge — caused by *another client*, not by reolink_talk.**
+Signature: every `TalkConfig` variant returns `421`/`422`, `TALKRESET` (cmd `11`) is itself **rejected with `400`**, and the lock **survives a full reconnect + re-login** — only a **camera reboot** clears it. This is **not** something reolink_talk's own clean operation can cause (we could only ever reproduce the shallow case from this component). It means **another client is holding the camera's single two-way-audio channel** — Reolink cameras allow only **one** talk session at a time, and the lock is tied to that other client's connection, which is why this component's own reconnect cannot release it (a reboot drops *all* connections, so it works).
+
+**Most common culprit: go2rtc / Frigate holding the RTSP backchannel open.**
+If a go2rtc stream source for the camera does **not** disable the backchannel, go2rtc negotiates and keeps a `sendonly` audio track (the talk input) open for the *entire* time it is streaming — permanently monopolizing the talk channel so reolink_talk can never acquire it.
+
+*Diagnose:* call the go2rtc API `GET /api/streams`; if the camera's producer `medias` lists an `audio, sendonly, …` track, go2rtc is holding the backchannel.
+
+*Fix:* add `#backchannel=0` to **every** go2rtc source for that camera (you don't need go2rtc's backchannel if you use reolink_talk for talk):
+
+```yaml
+streams:
+  my_gate:
+    - rtsp://USER:PASS@CAMERA_IP/Preview_01_main#backchannel=0
+```
+
+In a real deployment, a gate camera that deep-wedged roughly **once a day** stopped wedging **completely** after `#backchannel=0` was set (verified 2+ days). If your go2rtc runs embedded inside Frigate, the streams live in Frigate's config under `go2rtc:` → restart Frigate after editing.
+
+**Other clients that can hold the same channel** (check these if it still wedges):
+- The **Reolink mobile app's** push-to-talk — avoid using it on the same camera, or close the app after use.
+- The **official Reolink HA integration** keeps a persistent Baichuan connection; it does not drive talk itself, but it (and any extra RTSP/ONVIF viewer) consumes the camera's limited connection slots. Disabling it if unused reduces contention.
+
+Rule of thumb: **keep reolink_talk the only client touching the camera's two-way-audio channel.**
+
 ## License
 
 MIT. See `LICENSE`.
